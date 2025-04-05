@@ -4,9 +4,7 @@ import urllib.parse
 import urllib.request
 import base64
 
-sqs = boto3.client("sqs")
-
-SQS_QUEUE_URL = "https://sqs.ap-northeast-2.amazonaws.com/354918406440/delete-unattach-queue"
+lambda_client = boto3.client("lambda")
 
 def post_to_slack(response_url, message):
     req = urllib.request.Request(
@@ -18,6 +16,7 @@ def post_to_slack(response_url, message):
     try:
         with urllib.request.urlopen(req) as res:
             res.read()
+            print("✅ Successfully sent message to Slack")
     except Exception as e:
         print("❌ Failed to send Slack message:", e)
 
@@ -39,33 +38,40 @@ def lambda_handler(event, context):
     action = payload['actions'][0]
     value = json.loads(action['value'])
 
-    eips = value.get('eips', [])
-    enis = value.get('enis', [])
+    regional_eips = value.get('eips', {})
+    regional_enis = value.get('enis', {})
     response_url = payload.get('response_url')
 
+    # 4. Notify user that deletion is in progress
+    total_eips = sum(len(eips) for eips in regional_eips.values()) if regional_eips else 0
+    total_enis = sum(len(enis) for enis in regional_enis.values()) if regional_enis else 0
+    
+    post_to_slack(response_url, {
+        "response_type": "ephemeral",
+        "text": f"🔄 Resource deletion process has started. Please wait...\nTotal EIPs: {total_eips}, Total ENIs: {total_enis}"
+    })
+
     try:
-        sqs.send_message(
-            QueueUrl=SQS_QUEUE_URL,
-            MessageBody=json.dumps({
-                "eips": eips,
-                "enis": enis,
+        # 5. Invoke resource deletion Lambda function asynchronously
+        lambda_client.invoke(
+            FunctionName='executeDeleteUnattach',
+            InvocationType='Event',
+            Payload=json.dumps({
+                "regional_eips": regional_eips,
+                "regional_enis": regional_enis,
                 "response_url": response_url
             })
         )
-
-        post_to_slack(response_url, {
-            "response_type": "ephemeral",
-            "text": f"✅ Your deletion request has been received successfully.\nUnused EIPs: {', '.join(eips) or 'None'}\nUnused ENIs: {', '.join(enis) or 'None'}"
-        })
+        
+        print(f"✅ Successfully invoked resource deletion Lambda function")
     except Exception as e:
-        print("❌ Failed to send message to SQS:", e)
+        print(f"❌ Failed to invoke resource deletion Lambda function: {str(e)}")
         post_to_slack(response_url, {
             "response_type": "ephemeral",
-            "text": f"✅  Your deletion request has been received fail. \nEIP: {', '.join(eips) or 'None'}\nENI: {', '.join(enis) or 'None'}"
+            "text": f"❌ An error occurred while processing your deletion request: {str(e)}"
         })
-    
 
-    # 5. Return empty response immediately (Slack needs 200 fast)
+    # 6. Return empty response immediately (Slack needs 200 fast)
     return {
         "statusCode": 200,
         "headers": {
