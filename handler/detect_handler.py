@@ -1,7 +1,11 @@
 import boto3
 import concurrent.futures
 import time
-
+from eip.detector import detect_eips
+from eni.detector import detect_enis
+from util.slack import send_slack_block_response
+from util.slack_block import create_resource_detect_blocks
+from typing import Dict, Any, List
 
 def get_all_regions():
     """Returns a list of all AWS regions."""
@@ -16,30 +20,12 @@ def search_region_resources(region):
         ec2 = boto3.client('ec2', region_name=region)
         
         # Search for unattached EIPs
-        unused_eips = []
-        addresses = ec2.describe_addresses()['Addresses']
-        for address in addresses:
-            if 'InstanceId' not in address and 'NetworkInterfaceId' not in address:
-                eip_id = address['AllocationId']
-                unused_eips.append(eip_id)
-        
-        if unused_eips:
-            print(f"Found {len(unused_eips)} unused EIPs in region {region}")
+        unused_eips = detect_eips(ec2)
         
         # Search for unattached ENIs
-        unused_enis = []
-        enis = ec2.describe_network_interfaces(
-            Filters=[{'Name': 'status', 'Values': ['available']}]
-        )['NetworkInterfaces']
+        unused_enis = detect_enis(ec2)
         
-        for eni in enis:
-            eni_id = eni['NetworkInterfaceId']
-            unused_enis.append(eni_id)
-        
-        if unused_enis:
-            print(f"Found {len(unused_enis)} unused ENIs in region {region}")
-            
-        # Return region and results
+    
         result = {
             'region': region,
             'eips': unused_eips,
@@ -56,12 +42,10 @@ def search_region_resources(region):
             'error': str(e)
         }
 
-def find_unused_resources():
+def find_unused_resources() -> Dict[str, Dict[str, List[str]] ]:
     """Asynchronously finds unused resources across all regions."""
     all_regions = get_all_regions()
-    print(f"Regions to search: {all_regions}")
     
-    start_time = time.time()
     all_results = []
     
     # Use ThreadPoolExecutor for parallel region search
@@ -76,27 +60,33 @@ def find_unused_resources():
                 result = future.result()
                 all_results.append(result)
             except Exception as e:
-                print(f"Exception occurred while processing region {region}: {str(e)}")
                 all_results.append({
                     'region': region,
                     'eips': [],
                     'enis': [],
                     'error': str(e)
                 })
-    
-    # Process results
-    all_unused_eips = {}
-    all_unused_enis = {}
+
+    # Process results into the new format: {"eips": {"region": [...]}...}
+    all_unused_resources = {}
     
     for result in all_results:
         region = result['region']
         if 'error' not in result:
             if result['eips']:
-                all_unused_eips[region] = result['eips']
+                if "eips" not in all_unused_resources:
+                    all_unused_resources["eips"] = {}
+                all_unused_resources["eips"][region] = result['eips']
             if result['enis']:
-                all_unused_enis[region] = result['enis']
+                if "enis" not in all_unused_resources:
+                    all_unused_resources["enis"] = {}
+                all_unused_resources["enis"][region] = result['enis']
     
-    end_time = time.time()
-    print(f"Total search time: {end_time - start_time:.2f} seconds")
+    return all_unused_resources
+
+
+def detect_handler(response_url: str):
+    unused_resources = find_unused_resources()
+    blocks = create_resource_detect_blocks(unused_resources, response_url=response_url)
+    send_slack_block_response(response_url, blocks)
     
-    return all_unused_eips, all_unused_enis
